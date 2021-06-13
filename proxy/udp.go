@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"net"
 	"runtime"
-	"sync"
 	"time"
 
 	"golang.org/x/net/ipv4"
@@ -38,17 +37,6 @@ var udpOOBSize = func() int {
 }()
 
 func (p Proxy) serveUDP(l net.PacketConn, inflightRequests chan struct{}) error {
-	bpool := sync.Pool{
-		New: func() interface{} {
-			// Use the same buffer size as for TCP and truncate later. UDP and
-			// TCP share the cache, and we want to avoid storing truncated
-			// response for UDP that would be reused when the client falls back
-			// to TCP.
-			b := make([]byte, maxTCPSize)
-			return &b
-		},
-	}
-
 	c, ok := l.(*net.UDPConn)
 	if !ok {
 		return errors.New("not a UDP socket")
@@ -59,39 +47,47 @@ func (p Proxy) serveUDP(l net.PacketConn, inflightRequests chan struct{}) error 
 
 	for {
 		inflightRequests <- struct{}{}
-		buf := *bpool.Get().(*[]byte)
-		qsize, lip, raddr, err := readUDP(c, buf)
+		buf := bufferPoolGet(maxTCPSize) // Share size with TCP, we truncate later
+		qsize, lip, raddr, err := readUDP(c, *buf)
 		if err != nil {
+			bufferPoolPut(buf)
 			<-inflightRequests
 			if netErr, ok := err.(net.Error); ok && netErr.Temporary() {
-				bpool.Put(&buf)
 				continue
 			}
 			return err
 		}
 		if qsize <= 14 {
-			bpool.Put(&buf)
+			bufferPoolPut(buf)
 			<-inflightRequests
 			continue
 		}
+		if qsize <= bufferPools[len(bufferPools)-2].size {
+			// Incoming buffer is too large, we can get a smaller one
+			reducedBuf := bufferPoolGet(qsize)
+			copy((*reducedBuf)[:qsize], (*buf)[:qsize])
+			bufferPoolPut(buf)
+			buf = reducedBuf
+		}
+
 		start := time.Now()
 		go func() {
 			var err error
 			var rsize int
 			var ri resolver.ResolveInfo
-			q, err := query.New(buf[:qsize], addrIP(raddr))
+			q, err := query.New((*buf)[:qsize], addrIP(raddr))
 			if err != nil {
 				p.logErr(err)
 			}
-			rbuf := *bpool.Get().(*[]byte)
+			rbuf := bufferPoolGet(maxTCPSize)
 			defer func() {
 				if r := recover(); r != nil {
 					stackBuf := make([]byte, 64<<10)
 					stackBuf = stackBuf[:runtime.Stack(stackBuf, false)]
 					err = fmt.Errorf("panic: %v: %s", r, string(stackBuf))
 				}
-				bpool.Put(&buf)
-				bpool.Put(&rbuf)
+				bufferPoolPut(buf)
+				bufferPoolPut(rbuf)
 				<-inflightRequests
 				p.logQuery(QueryInfo{
 					PeerIP:            q.PeerIP,
@@ -112,8 +108,8 @@ func (p Proxy) serveUDP(l net.PacketConn, inflightRequests chan struct{}) error 
 				ctx, cancel = context.WithTimeout(ctx, p.Timeout)
 				defer cancel()
 			}
-			if rsize, ri, err = p.Resolve(ctx, q, rbuf); err != nil || rsize <= 0 || rsize > maxTCPSize {
-				rsize = replyServFail(q, rbuf)
+			if rsize, ri, err = p.Resolve(ctx, q, *rbuf); err != nil || rsize <= 0 || rsize > maxTCPSize {
+				rsize = replyServFail(q, *rbuf)
 			}
 			if rsize > maxUDPSize && (rsize > int(q.MsgSize) || rsize > maxDNS0Size) {
 				if q.MsgSize > maxUDPSize {
@@ -123,9 +119,9 @@ func (p Proxy) serveUDP(l net.PacketConn, inflightRequests chan struct{}) error 
 				} else {
 					rsize = maxUDPSize
 				}
-				rbuf[2] |= 0x2 // mark response as truncated
+				(*rbuf)[2] |= 0x2 // mark response as truncated
 			}
-			_, _, werr := c.WriteMsgUDP(rbuf[:rsize], oobWithSrc(lip), raddr)
+			_, _, werr := c.WriteMsgUDP((*rbuf)[:rsize], oobWithSrc(lip), raddr)
 			if err == nil {
 				// Do not overwrite resolve error when on cache fallback.
 				err = werr
@@ -137,12 +133,13 @@ func (p Proxy) serveUDP(l net.PacketConn, inflightRequests chan struct{}) error 
 // readUDP reads from c to buf and returns the local and remote addresses.
 func readUDP(c *net.UDPConn, buf []byte) (n int, lip net.IP, raddr *net.UDPAddr, err error) {
 	var oobn int
-	oob := make([]byte, udpOOBSize)
-	n, oobn, _, raddr, err = c.ReadMsgUDP(buf, oob)
+	oob := bufferPoolGet(udpOOBSize)
+	n, oobn, _, raddr, err = c.ReadMsgUDP(buf, *oob)
 	if err != nil {
 		return -1, nil, nil, err
 	}
-	lip = parseDstFromOOB(oob[:oobn])
+	lip = parseDstFromOOB((*oob)[:oobn])
+	bufferPoolPut(oob)
 	return n, lip, raddr, nil
 }
 
