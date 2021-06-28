@@ -1066,4 +1066,5 @@ openssl_get() {
         openssl s_client -quiet -connect "$host:443" 2>/dev/null
 }
 
+
 main
